@@ -20,14 +20,112 @@
 #include <cudf/utilities/error.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/exec_policy.hpp>
 
+#include <cuda/std/iterator>
+#include <thrust/count.h>
+#include <thrust/fill.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/scan.h>
+#include <thrust/sequence.h>
+
+#include <functional>
+#include <limits>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 
 namespace cudf {
 namespace detail {
 namespace {
 constexpr int DEFAULT_CACHE_SIZE = 128;
+
+void validate_conditional_full_join_materializable_size(std::size_t output_size)
+{
+  CUDF_EXPECTS(output_size <= static_cast<std::size_t>(std::numeric_limits<size_type>::max()),
+               "conditional full join output size exceeds cudf::size_type maximum",
+               std::overflow_error);
 }
+
+struct unmatched_right_row {
+  cudf::device_span<size_type const> right_row_has_match;
+
+  __device__ bool operator()(size_type row_index) const noexcept
+  {
+    return right_row_has_match[row_index] == 0;
+  }
+};
+
+struct conditional_full_join_setup_data {
+  cudf::nullate::DYNAMIC has_nulls;
+  ast::detail::expression_parser parser;
+  std::unique_ptr<table_device_view, std::function<void(table_device_view*)>> left_table;
+  std::unique_ptr<table_device_view, std::function<void(table_device_view*)>> right_table;
+  detail::grid_1d config;
+  thread_index_type shmem_size_per_block;
+};
+
+conditional_full_join_setup_data setup_conditional_full_join(
+  table_view const& left,
+  table_view const& right,
+  ast::expression const& binary_predicate,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const has_nulls =
+    cudf::nullate::DYNAMIC{binary_predicate.may_evaluate_null(left, right, stream)};
+
+  auto parser =
+    ast::detail::expression_parser{binary_predicate, left, right, has_nulls, stream, mr};
+  CUDF_EXPECTS(parser.output_type().id() == type_id::BOOL8,
+               "The expression must produce a boolean output.",
+               cudf::data_type_error);
+
+  auto left_table  = table_device_view::create(left, stream, mr);
+  auto right_table = table_device_view::create(right, stream, mr);
+
+  detail::grid_1d const config(left.num_rows(), DEFAULT_JOIN_BLOCK_SIZE);
+  auto const shmem_size_per_block = parser.shmem_per_thread * config.num_threads_per_block;
+
+  return {has_nulls,
+          std::move(parser),
+          std::move(left_table),
+          std::move(right_table),
+          config,
+          shmem_size_per_block};
+}
+
+void validate_conditional_full_join_predicate(table_view const& left,
+                                              table_view const& right,
+                                              ast::expression const& binary_predicate,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  auto const has_nulls =
+    cudf::nullate::DYNAMIC{binary_predicate.may_evaluate_null(left, right, stream)};
+  auto parser =
+    ast::detail::expression_parser{binary_predicate, left, right, has_nulls, stream, mr};
+  CUDF_EXPECTS(parser.output_type().id() == type_id::BOOL8,
+               "The expression must produce a boolean output.",
+               cudf::data_type_error);
+}
+
+std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
+          std::unique_ptr<rmm::device_uvector<size_type>>>
+make_trivial_left_join_indices(size_type num_rows,
+                               rmm::cuda_stream_view stream,
+                               rmm::device_async_resource_ref mr)
+{
+  auto left_indices = std::make_unique<rmm::device_uvector<size_type>>(
+    static_cast<std::size_t>(num_rows), stream, mr);
+  auto right_indices = std::make_unique<rmm::device_uvector<size_type>>(
+    static_cast<std::size_t>(num_rows), stream, mr);
+  thrust::sequence(rmm::exec_policy_nosync(stream, mr), left_indices->begin(), left_indices->end());
+  thrust::fill(
+    rmm::exec_policy_nosync(stream, mr), right_indices->begin(), right_indices->end(), JoinNoMatch);
+  return std::pair(std::move(left_indices), std::move(right_indices));
+}
+}  // namespace
 
 std::unique_ptr<rmm::device_uvector<size_type>> conditional_join_anti_semi(
   table_view const& left,
@@ -363,6 +461,201 @@ std::size_t compute_conditional_join_output_size(table_view const& left,
   return size.value(stream);
 }
 
+class conditional_full_join_size_data {
+ public:
+  conditional_full_join_size_data(size_type left_num_rows,
+                                  size_type right_num_rows,
+                                  rmm::cuda_stream_view stream)
+    : _left_num_rows{left_num_rows}, _right_num_rows{right_num_rows}, _stream{stream}
+  {
+  }
+
+  conditional_full_join_size_data(size_type left_num_rows,
+                                  size_type right_num_rows,
+                                  rmm::cuda_stream_view stream,
+                                  conditional_full_join_setup_data setup,
+                                  std::size_t left_outer_output_size,
+                                  std::size_t right_complement_size,
+                                  rmm::device_uvector<size_type> matches_per_left_row,
+                                  rmm::device_uvector<size_type> right_row_has_match)
+    : _left_num_rows{left_num_rows},
+      _right_num_rows{right_num_rows},
+      _stream{stream},
+      _setup{std::move(setup)},
+      _left_outer_output_size{left_outer_output_size},
+      _right_complement_size{right_complement_size},
+      _matches_per_left_row{std::move(matches_per_left_row)},
+      _right_row_has_match{std::move(right_row_has_match)}
+  {
+  }
+
+  [[nodiscard]] std::size_t output_size() const
+  {
+    if (!_setup.has_value()) { return static_cast<std::size_t>(_left_num_rows + _right_num_rows); }
+    return _left_outer_output_size + _right_complement_size;
+  }
+
+  [[nodiscard]] std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
+                          std::unique_ptr<rmm::device_uvector<size_type>>>
+  materialize_indices(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  {
+    CUDF_EXPECTS(stream == _stream,
+                 "conditional full join retained state must be materialized on the stream used to "
+                 "create it");
+
+    if (!_setup.has_value()) {
+      if (_right_num_rows == 0) {
+        return make_trivial_left_join_indices(_left_num_rows, stream, mr);
+      }
+      auto right_only = make_trivial_left_join_indices(_right_num_rows, stream, mr);
+      return std::pair(std::move(right_only.second), std::move(right_only.first));
+    }
+
+    auto& setup           = *_setup;
+    auto const total_size = output_size();
+    validate_conditional_full_join_materializable_size(total_size);
+    auto left_indices  = std::make_unique<rmm::device_uvector<size_type>>(total_size, stream, mr);
+    auto right_indices = std::make_unique<rmm::device_uvector<size_type>>(total_size, stream, mr);
+
+    auto const left_matches_span = cudf::device_span<size_type const>{
+      _matches_per_left_row->begin(), static_cast<std::size_t>(_left_num_rows)};
+    auto left_offsets =
+      rmm::device_uvector<size_type>{static_cast<std::size_t>(_left_num_rows), stream, mr};
+    thrust::exclusive_scan(rmm::exec_policy_nosync(stream, mr),
+                           left_matches_span.begin(),
+                           left_matches_span.end(),
+                           left_offsets.begin());
+
+    if (setup.has_nulls) {
+      conditional_left_join_from_size_data<DEFAULT_JOIN_BLOCK_SIZE, true>
+        <<<setup.config.num_blocks,
+           setup.config.num_threads_per_block,
+           setup.shmem_size_per_block,
+           stream.value()>>>(*setup.left_table,
+                             *setup.right_table,
+                             setup.parser.device_expression_data,
+                             left_offsets.data(),
+                             left_indices->data(),
+                             right_indices->data());
+    } else {
+      conditional_left_join_from_size_data<DEFAULT_JOIN_BLOCK_SIZE, false>
+        <<<setup.config.num_blocks,
+           setup.config.num_threads_per_block,
+           setup.shmem_size_per_block,
+           stream.value()>>>(*setup.left_table,
+                             *setup.right_table,
+                             setup.parser.device_expression_data,
+                             left_offsets.data(),
+                             left_indices->data(),
+                             right_indices->data());
+    }
+
+    if (_right_complement_size > 0) {
+      auto const complement_begin = static_cast<std::ptrdiff_t>(_left_outer_output_size);
+      auto left_complement_begin  = left_indices->begin() + complement_begin;
+      auto right_complement_begin = right_indices->begin() + complement_begin;
+      auto const right_match_span = cudf::device_span<size_type const>{
+        _right_row_has_match->begin(), static_cast<std::size_t>(_right_num_rows)};
+
+      thrust::fill(rmm::exec_policy_nosync(stream, mr),
+                   left_complement_begin,
+                   left_complement_begin + static_cast<std::ptrdiff_t>(_right_complement_size),
+                   JoinNoMatch);
+      auto complement_end = thrust::copy_if(rmm::exec_policy_nosync(stream, mr),
+                                            thrust::counting_iterator<size_type>(0),
+                                            thrust::counting_iterator<size_type>(_right_num_rows),
+                                            right_complement_begin,
+                                            unmatched_right_row{right_match_span});
+      CUDF_EXPECTS(static_cast<std::size_t>(cuda::std::distance(
+                     right_complement_begin, complement_end)) == _right_complement_size,
+                   "conditional full join state materialized an unexpected right complement size",
+                   std::logic_error);
+    }
+
+    return std::pair(std::move(left_indices), std::move(right_indices));
+  }
+
+ private:
+  size_type _left_num_rows;
+  size_type _right_num_rows;
+  rmm::cuda_stream_view _stream;
+  std::optional<conditional_full_join_setup_data> _setup{};
+  std::size_t _left_outer_output_size = 0;
+  std::size_t _right_complement_size  = 0;
+  std::optional<rmm::device_uvector<size_type>> _matches_per_left_row{};
+  std::optional<rmm::device_uvector<size_type>> _right_row_has_match{};
+};
+
+std::unique_ptr<conditional_full_join_size_data> compute_conditional_full_join_size_data(
+  table_view const& left,
+  table_view const& right,
+  ast::expression const& binary_predicate,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const left_num_rows  = left.num_rows();
+  auto const right_num_rows = right.num_rows();
+
+  if (right_num_rows == 0 || left_num_rows == 0) {
+    validate_conditional_full_join_predicate(left, right, binary_predicate, stream, mr);
+    validate_conditional_full_join_materializable_size(
+      static_cast<std::size_t>(left_num_rows + right_num_rows));
+    return std::make_unique<conditional_full_join_size_data>(left_num_rows, right_num_rows, stream);
+  }
+
+  auto setup = setup_conditional_full_join(left, right, binary_predicate, stream, mr);
+
+  auto matches_per_left_row =
+    rmm::device_uvector<size_type>{static_cast<std::size_t>(left_num_rows), stream, mr};
+  auto right_row_has_match =
+    rmm::device_uvector<size_type>{static_cast<std::size_t>(right_num_rows), stream, mr};
+  thrust::fill(
+    rmm::exec_policy_nosync(stream, mr), right_row_has_match.begin(), right_row_has_match.end(), 0);
+
+  if (setup.has_nulls) {
+    compute_conditional_full_join_size_data<DEFAULT_JOIN_BLOCK_SIZE, true>
+      <<<setup.config.num_blocks,
+         setup.config.num_threads_per_block,
+         setup.shmem_size_per_block,
+         stream.value()>>>(*setup.left_table,
+                           *setup.right_table,
+                           setup.parser.device_expression_data,
+                           matches_per_left_row.data(),
+                           right_row_has_match.data());
+  } else {
+    compute_conditional_full_join_size_data<DEFAULT_JOIN_BLOCK_SIZE, false>
+      <<<setup.config.num_blocks,
+         setup.config.num_threads_per_block,
+         setup.shmem_size_per_block,
+         stream.value()>>>(*setup.left_table,
+                           *setup.right_table,
+                           setup.parser.device_expression_data,
+                           matches_per_left_row.data(),
+                           right_row_has_match.data());
+  }
+
+  auto const left_outer_output_size = thrust::reduce(rmm::exec_policy_nosync(stream, mr),
+                                                     matches_per_left_row.begin(),
+                                                     matches_per_left_row.end(),
+                                                     std::size_t{0});
+  auto const right_complement_size =
+    static_cast<std::size_t>(thrust::count(rmm::exec_policy_nosync(stream, mr),
+                                           right_row_has_match.begin(),
+                                           right_row_has_match.end(),
+                                           size_type{0}));
+  validate_conditional_full_join_materializable_size(left_outer_output_size +
+                                                     right_complement_size);
+
+  return std::make_unique<conditional_full_join_size_data>(left_num_rows,
+                                                           right_num_rows,
+                                                           stream,
+                                                           std::move(setup),
+                                                           left_outer_output_size,
+                                                           right_complement_size,
+                                                           std::move(matches_per_left_row),
+                                                           std::move(right_row_has_match));
+}
+
 }  // namespace detail
 
 std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
@@ -404,6 +697,37 @@ conditional_full_join(table_view const& left,
   CUDF_FUNC_RANGE();
   return detail::conditional_join(
     left, right, binary_predicate, join_kind::FULL_JOIN, {}, stream, mr);
+}
+
+conditional_full_join_size_data::~conditional_full_join_size_data() = default;
+
+conditional_full_join_size_data::conditional_full_join_size_data(
+  std::unique_ptr<cudf::detail::conditional_full_join_size_data> impl)
+  : _impl{std::move(impl)}
+{
+  CUDF_EXPECTS(_impl != nullptr, "conditional full join size data implementation is null");
+}
+
+std::size_t conditional_full_join_size_data::output_size() const { return _impl->output_size(); }
+
+std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
+          std::unique_ptr<rmm::device_uvector<size_type>>>
+conditional_full_join_size_data::materialize_indices(rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr) const
+{
+  return _impl->materialize_indices(stream, mr);
+}
+
+std::unique_ptr<conditional_full_join_size_data> conditional_full_join_size(
+  table_view const& left,
+  table_view const& right,
+  ast::expression const& binary_predicate,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+  return std::unique_ptr<conditional_full_join_size_data>{new conditional_full_join_size_data{
+    detail::compute_conditional_full_join_size_data(left, right, binary_predicate, stream, mr)}};
 }
 
 std::unique_ptr<rmm::device_uvector<size_type>> conditional_left_semi_join(

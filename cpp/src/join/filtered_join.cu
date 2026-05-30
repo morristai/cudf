@@ -31,10 +31,13 @@
 #include <cuco/operator.hpp>
 #include <cuco/static_set_ref.cuh>
 #include <cuda/iterator>
+#include <thrust/copy.h>
+#include <thrust/count.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/sequence.h>
 
 #include <memory>
+#include <stdexcept>
 
 namespace cudf {
 namespace detail {
@@ -78,6 +81,71 @@ struct gather_mask {
   {
     return flagged[idx] == (kind == join_kind::LEFT_SEMI_JOIN);
   }
+};
+
+class contains_map_filtered_join_probe_state : public cudf::detail::filtered_join_probe_state {
+ public:
+  contains_map_filtered_join_probe_state(join_kind kind,
+                                         cudf::size_type probe_rows,
+                                         cudf::size_type output_size,
+                                         rmm::device_uvector<bool> contains_map)
+    : _kind{kind},
+      _probe_rows{probe_rows},
+      _output_size{output_size},
+      _contains_map{std::move(contains_map)}
+  {
+  }
+
+  [[nodiscard]] cudf::size_type output_size() const override { return _output_size; }
+
+  [[nodiscard]] std::size_t device_allocated_size_bytes() const override
+  {
+    return _contains_map.capacity() * sizeof(bool);
+  }
+
+  [[nodiscard]] std::unique_ptr<rmm::device_uvector<cudf::size_type>> materialize_indices(
+    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const override
+  {
+    rmm::device_uvector<cudf::size_type> gather_map(_output_size, stream, mr);
+    auto gather_map_end = thrust::copy_if(rmm::exec_policy_nosync(stream),
+                                          thrust::counting_iterator<size_type>(0),
+                                          thrust::counting_iterator<size_type>(_probe_rows),
+                                          gather_map.begin(),
+                                          gather_mask{_kind, _contains_map});
+    CUDF_EXPECTS(cuda::std::distance(gather_map.begin(), gather_map_end) == _output_size,
+                 "filtered join probe state materialized an unexpected number of indices",
+                 std::logic_error);
+    return std::make_unique<rmm::device_uvector<cudf::size_type>>(std::move(gather_map));
+  }
+
+ private:
+  join_kind _kind;
+  cudf::size_type _probe_rows;
+  cudf::size_type _output_size;
+  rmm::device_uvector<bool> _contains_map;
+};
+
+class sequence_filtered_join_probe_state : public cudf::detail::filtered_join_probe_state {
+ public:
+  explicit sequence_filtered_join_probe_state(cudf::size_type output_size)
+    : _output_size{output_size}
+  {
+  }
+
+  [[nodiscard]] cudf::size_type output_size() const override { return _output_size; }
+
+  [[nodiscard]] std::size_t device_allocated_size_bytes() const override { return 0; }
+
+  [[nodiscard]] std::unique_ptr<rmm::device_uvector<cudf::size_type>> materialize_indices(
+    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const override
+  {
+    auto result = std::make_unique<rmm::device_uvector<cudf::size_type>>(_output_size, stream, mr);
+    thrust::sequence(rmm::exec_policy_nosync(stream), result->begin(), result->end());
+    return result;
+  }
+
+ private:
+  cudf::size_type _output_size;
 };
 
 }  // namespace
@@ -213,6 +281,74 @@ std::unique_ptr<rmm::device_uvector<cudf::size_type>> distinct_filtered_join::qu
   return std::make_unique<rmm::device_uvector<size_type>>(std::move(gather_map));
 }
 
+template <int32_t CGSize, typename Ref>
+std::unique_ptr<cudf::detail::filtered_join_probe_state>
+distinct_filtered_join::begin_query_build_table_probe(
+  cudf::table_view const& probe,
+  std::shared_ptr<cudf::detail::row::equality::preprocessed_table> preprocessed_probe,
+  join_kind kind,
+  Ref query_ref,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  cudf::scoped_range range{"distinct_filtered_join::begin_query_build_table_probe"};
+  auto const probe_has_nulls = has_nested_nulls(probe);
+
+  auto query_set = [this,
+                    probe,
+                    probe_has_nulls,
+                    query_ref,
+                    stream]<typename InputProbeIterator, typename OutputContainsIterator>(
+                     InputProbeIterator probe_iter, OutputContainsIterator contains_iter) {
+    auto const grid_size = cuco::detail::grid_size(probe.num_rows(), CGSize);
+    if (probe_has_nulls && _nulls_equal == null_equality::UNEQUAL) {
+      auto const bitmask_buffer_and_ptr = build_row_bitmask(probe, stream);
+      auto const row_bitmask_ptr        = bitmask_buffer_and_ptr.second;
+      cuco::detail::open_addressing_ns::contains_if_n<CGSize, cuco::detail::default_block_size()>
+        <<<grid_size, cuco::detail::default_block_size(), 0, stream.value()>>>(
+          probe_iter,
+          probe.num_rows(),
+          thrust::counting_iterator<size_type>{0},
+          row_is_valid{row_bitmask_ptr},
+          contains_iter,
+          query_ref);
+    } else {
+      cuco::detail::open_addressing_ns::contains_if_n<CGSize, cuco::detail::default_block_size()>
+        <<<grid_size, cuco::detail::default_block_size(), 0, stream.value()>>>(
+          probe_iter,
+          probe.num_rows(),
+          cuda::constant_iterator<bool>{true},
+          cuda::std::identity{},
+          contains_iter,
+          query_ref);
+    }
+  };
+
+  auto contains_map = rmm::device_uvector<bool>(probe.num_rows(), stream, mr);
+  if (is_primitive_row_op_compatible(_build)) {
+    auto const d_probe_hasher = primitive_row_hasher{nullate::DYNAMIC{true}, preprocessed_probe};
+    auto const probe_iter     = cudf::detail::make_counting_transform_iterator(
+      size_type{0}, key_pair_fn<rhs_index_type, primitive_row_hasher>{d_probe_hasher});
+
+    query_set(probe_iter, contains_map.begin());
+  } else {
+    auto const d_probe_hasher =
+      cudf::detail::row::hash::row_hasher{preprocessed_probe}.device_hasher(nullate::YES{});
+    auto const probe_iter = cudf::detail::make_counting_transform_iterator(
+      size_type{0}, key_pair_fn<rhs_index_type, row_hasher>{d_probe_hasher});
+
+    query_set(probe_iter, contains_map.begin());
+  }
+
+  auto const output_size = static_cast<cudf::size_type>(
+    thrust::count_if(rmm::exec_policy_nosync(stream),
+                     thrust::counting_iterator<size_type>(0),
+                     thrust::counting_iterator<size_type>(probe.num_rows()),
+                     gather_mask{kind, contains_map}));
+  return std::make_unique<contains_map_filtered_join_probe_state>(
+    kind, probe.num_rows(), output_size, std::move(contains_map));
+}
+
 filtered_join::filtered_join(cudf::table_view const& build,
                              cudf::null_equality compare_nulls,
                              double load_factor,
@@ -340,6 +476,65 @@ std::unique_ptr<rmm::device_uvector<cudf::size_type>> distinct_filtered_join::se
   }
 }
 
+std::unique_ptr<cudf::detail::filtered_join_probe_state>
+distinct_filtered_join::semi_anti_probe_state(cudf::table_view const& probe,
+                                              join_kind kind,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  cudf::scoped_range range{"distinct_filtered_join::semi_anti_probe_state"};
+
+  auto const preprocessed_probe = [&probe, stream] {
+    cudf::scoped_range range{"distinct_filtered_join::semi_anti_probe_state::preprocessed_probe"};
+    return cudf::detail::row::equality::preprocessed_table::create(probe, stream);
+  }();
+
+  if (is_primitive_row_op_compatible(_build)) {
+    auto const d_build_probe_comparator = primitive_row_comparator{
+      nullate::DYNAMIC{true}, _preprocessed_build, preprocessed_probe, _nulls_equal};
+
+    cuco::static_set_ref set_ref{empty_sentinel_key,
+                                 comparator_adapter{d_build_probe_comparator},
+                                 primitive_probing_scheme{},
+                                 cuco::thread_scope_device,
+                                 _bucket_storage.ref()};
+    auto query_ref = set_ref.rebind_operators(cuco::op::contains);
+    return begin_query_build_table_probe<primitive_probing_scheme::cg_size>(
+      probe, preprocessed_probe, kind, query_ref, stream, mr);
+  } else {
+    auto const d_build_probe_comparator =
+      cudf::detail::row::equality::two_table_comparator{_preprocessed_build, preprocessed_probe};
+
+    if (_build_props.has_nested_columns) {
+      auto d_build_probe_nan_comparator = d_build_probe_comparator.equal_to<true>(
+        nullate::YES{},
+        _nulls_equal,
+        cudf::detail::row::equality::nan_equal_physical_equality_comparator{});
+      cuco::static_set_ref set_ref{empty_sentinel_key,
+                                   comparator_adapter{d_build_probe_nan_comparator},
+                                   nested_probing_scheme{},
+                                   cuco::thread_scope_device,
+                                   _bucket_storage.ref()};
+      auto query_ref = set_ref.rebind_operators(cuco::op::contains);
+      return begin_query_build_table_probe<nested_probing_scheme::cg_size>(
+        probe, preprocessed_probe, kind, query_ref, stream, mr);
+    } else {
+      auto d_build_probe_nan_comparator = d_build_probe_comparator.equal_to<false>(
+        nullate::YES{},
+        _nulls_equal,
+        cudf::detail::row::equality::nan_equal_physical_equality_comparator{});
+      cuco::static_set_ref set_ref{empty_sentinel_key,
+                                   comparator_adapter{d_build_probe_nan_comparator},
+                                   simple_probing_scheme{},
+                                   cuco::thread_scope_device,
+                                   _bucket_storage.ref()};
+      auto query_ref = set_ref.rebind_operators(cuco::op::contains);
+      return begin_query_build_table_probe<simple_probing_scheme::cg_size>(
+        probe, preprocessed_probe, kind, query_ref, stream, mr);
+    }
+  }
+}
+
 std::unique_ptr<rmm::device_uvector<cudf::size_type>> distinct_filtered_join::semi_join(
   cudf::table_view const& probe, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
 {
@@ -368,7 +563,54 @@ std::unique_ptr<rmm::device_uvector<cudf::size_type>> distinct_filtered_join::an
   return semi_anti_join(probe, join_kind::LEFT_ANTI_JOIN, stream, mr);
 }
 
+std::unique_ptr<cudf::detail::filtered_join_probe_state>
+distinct_filtered_join::begin_left_semi_probe(cudf::table_view const& probe,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  if (_build.num_rows() == 0 || probe.num_rows() == 0) {
+    return std::make_unique<sequence_filtered_join_probe_state>(0);
+  }
+
+  return semi_anti_probe_state(probe, join_kind::LEFT_SEMI_JOIN, stream, mr);
+}
+
+std::unique_ptr<cudf::detail::filtered_join_probe_state>
+distinct_filtered_join::begin_left_anti_probe(cudf::table_view const& probe,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  if (probe.num_rows() == 0) { return std::make_unique<sequence_filtered_join_probe_state>(0); }
+  if (_build.num_rows() == 0) {
+    return std::make_unique<sequence_filtered_join_probe_state>(probe.num_rows());
+  }
+
+  return semi_anti_probe_state(probe, join_kind::LEFT_ANTI_JOIN, stream, mr);
+}
+
 }  // namespace detail
+
+filtered_join_probe_state::~filtered_join_probe_state() = default;
+
+filtered_join_probe_state::filtered_join_probe_state(
+  std::unique_ptr<cudf::detail::filtered_join_probe_state> impl)
+  : _impl{std::move(impl)}
+{
+  CUDF_EXPECTS(_impl != nullptr, "filtered join probe state implementation is null");
+}
+
+size_type filtered_join_probe_state::output_size() const { return _impl->output_size(); }
+
+std::size_t filtered_join_probe_state::device_allocated_size_bytes() const
+{
+  return _impl->device_allocated_size_bytes();
+}
+
+std::unique_ptr<rmm::device_uvector<size_type>> filtered_join_probe_state::materialize_indices(
+  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+{
+  return _impl->materialize_indices(stream, mr);
+}
 
 filtered_join::~filtered_join() = default;
 
@@ -409,6 +651,24 @@ std::unique_ptr<rmm::device_uvector<size_type>> filtered_join::anti_join(
   rmm::device_async_resource_ref mr) const
 {
   return _impl->anti_join(probe, stream, mr);
+}
+
+std::unique_ptr<filtered_join_probe_state> filtered_join::begin_left_semi_probe(
+  cudf::table_view const& probe,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
+  return std::unique_ptr<filtered_join_probe_state>{
+    new filtered_join_probe_state{_impl->begin_left_semi_probe(probe, stream, mr)}};
+}
+
+std::unique_ptr<filtered_join_probe_state> filtered_join::begin_left_anti_probe(
+  cudf::table_view const& probe,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
+  return std::unique_ptr<filtered_join_probe_state>{
+    new filtered_join_probe_state{_impl->begin_left_anti_probe(probe, stream, mr)}};
 }
 
 }  // namespace cudf

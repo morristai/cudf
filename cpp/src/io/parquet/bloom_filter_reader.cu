@@ -34,6 +34,22 @@
 namespace cudf::io::parquet::detail {
 namespace {
 
+template <typename T>
+bool literal_matches_dispatched_dtype(cudf::data_type dtype, ast::literal const* const literal)
+{
+  return dtype == literal->get_data_type() and
+         cudf::type_id_matches_device_storage_type<T>(dtype.id());
+}
+
+std::string literal_type_mismatch_message(cudf::data_type dtype, ast::literal const* const literal)
+{
+  auto const literal_type = literal->get_data_type();
+  return "Mismatched predicate column and literal types: column=" + cudf::type_to_name(dtype) +
+         " scale=" + std::to_string(dtype.scale()) +
+         ", literal=" + cudf::type_to_name(literal_type) +
+         " scale=" + std::to_string(literal_type.scale());
+}
+
 /**
  * @brief Converts bloom filter membership results (for each column chunk) to a device column.
  *
@@ -62,12 +78,9 @@ struct bloom_filter_caster {
     using word_type         = typename policy_type::word_type;
 
     // Check if the literal has the same type as the predicate column
-    CUDF_EXPECTS(
-      dtype == literal->get_data_type() and
-        cudf::have_same_types(
-          cudf::column_view{dtype, 0, {}, {}, 0, 0, {}},
-          cudf::scalar_type_t<T>(T{}, false, stream, cudf::get_current_device_resource_ref())),
-      "Mismatched predicate column and literal types");
+    if (not literal_matches_dispatched_dtype<T>(dtype, literal)) {
+      throw cudf::logic_error{literal_type_mismatch_message(dtype, literal)};
+    }
 
     // Filter properties
     auto constexpr bytes_per_block = sizeof(word_type) * policy_type::words_per_block;

@@ -28,6 +28,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/mr/tracking_resource_adaptor.hpp>
 
 #include <cuco/utility/error.hpp>
 
@@ -51,6 +52,24 @@ constexpr cudf::size_type NoneValue =
   std::numeric_limits<cudf::size_type>::min();  // TODO: how to test if this isn't public?
 enum class algorithm { HASH, SORT_MERGE, MERGE };
 
+class scoped_current_device_resource {
+ public:
+  explicit scoped_current_device_resource(rmm::mr::device_memory_resource* mr)
+    : _previous{cudf::set_current_device_resource(mr)}
+  {
+  }
+
+  ~scoped_current_device_resource() { cudf::set_current_device_resource(_previous); }
+
+  scoped_current_device_resource(scoped_current_device_resource const&)            = delete;
+  scoped_current_device_resource(scoped_current_device_resource&&)                 = delete;
+  scoped_current_device_resource& operator=(scoped_current_device_resource const&) = delete;
+  scoped_current_device_resource& operator=(scoped_current_device_resource&&)      = delete;
+
+ private:
+  rmm::mr::device_memory_resource* _previous;
+};
+
 void expect_match_counts_equal(rmm::device_uvector<cudf::size_type> const& actual_counts,
                                std::vector<cudf::size_type> const& expected_counts,
                                rmm::cuda_stream_view stream)
@@ -62,6 +81,26 @@ void expect_match_counts_equal(rmm::device_uvector<cudf::size_type> const& actua
   EXPECT_TRUE(
     std::equal(host_actual_counts.begin(), host_actual_counts.end(), expected_counts.begin()))
     << "Match counts do not equal expected counts";
+}
+
+std::size_t retained_hash_join_allocation_size(cudf::table_view const& build, double load_factor)
+{
+  auto stream      = cudf::get_default_stream();
+  auto tracking_mr = rmm::mr::tracking_resource_adaptor<rmm::mr::device_memory_resource>{
+    cudf::get_current_device_resource_ref()};
+  auto retained_bytes = std::size_t{0};
+
+  {
+    scoped_current_device_resource resource_scope{&tracking_mr};
+    {
+      auto hash_join = cudf::hash_join(
+        build, cudf::nullable_join::YES, cudf::null_equality::EQUAL, load_factor, stream);
+      retained_bytes = tracking_mr.get_allocated_bytes();
+    }
+    EXPECT_EQ(0, tracking_mr.get_allocated_bytes());
+  }
+
+  return retained_bytes;
 }
 
 using JoinResult = std::pair<std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
@@ -301,6 +340,83 @@ TEST_F(JoinTest, InvalidLoadFactor)
   // Test load factor > 1
   EXPECT_THROW(cudf::hash_join(t0, cudf::nullable_join::NO, cudf::null_equality::EQUAL, 1.5),
                cuco::logic_error);
+}
+
+TEST_F(JoinTest, HashJoinPreBuildReservationSizeMatchesRetainedAllocations)
+{
+  column_wrapper<int32_t> col0{{3, 1, 2, 0, 3}, {true, false, true, true, true}};
+  strcol_wrapper col1({"s0", "s1", "s2", "s4", "s1"});
+
+  CVector cols;
+  cols.push_back(col0.release());
+  cols.push_back(col1.release());
+  Table build(std::move(cols));
+
+  for (auto load_factor : {0.5, 1.0}) {
+    EXPECT_EQ(cudf::hash_join::pre_build_reservation_size(build.view(), load_factor),
+              retained_hash_join_allocation_size(build.view(), load_factor));
+  }
+}
+
+TEST_F(JoinTest, HashJoinPreBuildReservationSizeMatchesEmptyBuildRows)
+{
+  column_wrapper<int32_t> col0;
+  strcol_wrapper col1;
+
+  CVector cols;
+  cols.push_back(col0.release());
+  cols.push_back(col1.release());
+  Table build(std::move(cols));
+
+  double constexpr load_factor = 0.5;
+  EXPECT_EQ(cudf::hash_join::pre_build_reservation_size(build.view(), load_factor),
+            retained_hash_join_allocation_size(build.view(), load_factor));
+}
+
+TEST_F(JoinTest, HashJoinPreBuildReservationSizeRejectsUnsupportedInputs)
+{
+  {
+    CVector cols;
+    Table build(std::move(cols));
+
+    EXPECT_THROW(static_cast<void>(cudf::hash_join::pre_build_reservation_size(build.view(), 0.5)),
+                 std::invalid_argument);
+  }
+
+  {
+    column_wrapper<int32_t> col0{{3, 1, 2, 0, 3}};
+    CVector cols;
+    cols.push_back(col0.release());
+    Table build(std::move(cols));
+
+    EXPECT_THROW(static_cast<void>(cudf::hash_join::pre_build_reservation_size(build.view(), -0.1)),
+                 std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(cudf::hash_join::pre_build_reservation_size(build.view(), 0.0)),
+                 std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(cudf::hash_join::pre_build_reservation_size(build.view(), 1.1)),
+                 std::invalid_argument);
+  }
+
+  {
+    auto child = column_wrapper<int32_t>{{3, 1, 2, 0, 3}};
+    auto col0  = cudf::test::structs_column_wrapper{{child}};
+    CVector cols;
+    cols.push_back(col0.release());
+    Table build(std::move(cols));
+
+    EXPECT_THROW(static_cast<void>(cudf::hash_join::pre_build_reservation_size(build.view(), 0.5)),
+                 std::invalid_argument);
+  }
+
+  {
+    strcol_wrapper col0({"s0", "s1", "s2", "s4", "s1"}, {true, true, false, true, true});
+    CVector cols;
+    cols.push_back(col0.release());
+    Table build(std::move(cols));
+
+    EXPECT_THROW(static_cast<void>(cudf::hash_join::pre_build_reservation_size(build.view(), 0.5)),
+                 std::invalid_argument);
+  }
 }
 
 struct JoinParameterizedTest : public JoinTest, public testing::WithParamInterface<algorithm> {};

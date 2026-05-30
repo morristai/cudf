@@ -247,7 +247,8 @@ std::pair<rmm::device_buffer, size_type> bitmask_binop(Binop op,
                           masks,
                           masks_begin_bits,
                           mask_size_bits,
-                          stream);
+                          stream,
+                          mr);
 
   return std::pair(std::move(dest_mask), null_count);
 }
@@ -282,8 +283,8 @@ segmented_bitmask_binop(Binop op,
     h_destination_masks_ptrs.push_back(
       static_cast<bitmask_type*>(h_destination_masks.back()->data()));
   }
-  auto destination_masks = cudf::detail::make_device_uvector_async(
-    h_destination_masks_ptrs, stream, cudf::get_current_device_resource_ref());
+  auto destination_masks =
+    cudf::detail::make_device_uvector_async(h_destination_masks_ptrs, stream, mr);
 
   // for destination size, pass number of words in each destination buffer instead of number of bits
   auto null_counts = inplace_segmented_bitmask_binop(op,
@@ -294,7 +295,7 @@ segmented_bitmask_binop(Binop op,
                                                      mask_size_bits,
                                                      segment_offsets,
                                                      stream,
-                                                     cudf::get_current_device_resource_ref());
+                                                     mr);
 
   return std::pair(std::move(h_destination_masks),
                    cudf::detail::make_std_vector<size_type>(null_counts, stream));
@@ -313,12 +314,14 @@ segmented_bitmask_binop(Binop op,
  * @return size_type Count of set bits
  */
 template <typename Binop>
-size_type inplace_bitmask_binop(Binop op,
-                                device_span<bitmask_type> dest_mask,
-                                host_span<bitmask_type const* const> masks,
-                                host_span<size_type const> masks_begin_bits,
-                                size_type mask_size_bits,
-                                rmm::cuda_stream_view stream)
+size_type inplace_bitmask_binop(
+  Binop op,
+  device_span<bitmask_type> dest_mask,
+  host_span<bitmask_type const* const> masks,
+  host_span<size_type const> masks_begin_bits,
+  size_type mask_size_bits,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   CUDF_EXPECTS(
     std::all_of(masks_begin_bits.begin(), masks_begin_bits.end(), [](auto b) { return b >= 0; }),
@@ -327,7 +330,6 @@ size_type inplace_bitmask_binop(Binop op,
   CUDF_EXPECTS(std::all_of(masks.begin(), masks.end(), [](auto p) { return p != nullptr; }),
                "Mask pointer cannot be null");
 
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref();
   cudf::detail::device_scalar<size_type> d_counter{0, stream, mr};
 
   auto d_masks      = cudf::detail::make_device_uvector_async(masks, stream, mr);
@@ -383,11 +385,9 @@ rmm::device_uvector<size_type> inplace_segmented_bitmask_binop(
                "At least one segment needs to be passed for bitwise operations");
 
   rmm::device_uvector<size_type> d_null_counts(segment_offsets.size() - 1, stream, mr);
-  auto temp_mr      = cudf::get_current_device_resource_ref();
-  auto d_masks      = cudf::detail::make_device_uvector_async(masks, stream, temp_mr);
-  auto d_begin_bits = cudf::detail::make_device_uvector_async(masks_begin_bits, stream, temp_mr);
-  auto d_segment_offsets =
-    cudf::detail::make_device_uvector_async(segment_offsets, stream, temp_mr);
+  auto d_masks           = cudf::detail::make_device_uvector_async(masks, stream, mr);
+  auto d_begin_bits      = cudf::detail::make_device_uvector_async(masks_begin_bits, stream, mr);
+  auto d_segment_offsets = cudf::detail::make_device_uvector_async(segment_offsets, stream, mr);
 
   auto constexpr block_size = 256;
   auto constexpr warps_per_block =

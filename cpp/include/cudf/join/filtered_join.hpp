@@ -14,6 +14,8 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <cstddef>
+#include <memory>
 #include <utility>
 
 namespace CUDF_EXPORT cudf {
@@ -29,6 +31,7 @@ namespace detail {
  * @brief Forward declaration for our filtered hash join
  */
 class filtered_join;
+class filtered_join_probe_state;
 }  // namespace detail
 
 /**
@@ -36,6 +39,51 @@ class filtered_join;
  * @see filtered_join
  */
 enum class set_as_build_table { LEFT, RIGHT };
+
+/**
+ * @brief Retained state for a filtered semi/anti probe.
+ *
+ * This object owns the device-side membership result of probing a reusable
+ * filtered join. It lets bounded callers observe the exact output row count
+ * before allocating the final gather map, then materialize that gather map
+ * without probing the hash table again.
+ */
+class filtered_join_probe_state {
+ public:
+  filtered_join_probe_state() = delete;
+  ~filtered_join_probe_state();
+  filtered_join_probe_state(filtered_join_probe_state const&)            = delete;
+  filtered_join_probe_state(filtered_join_probe_state&&)                 = delete;
+  filtered_join_probe_state& operator=(filtered_join_probe_state const&) = delete;
+  filtered_join_probe_state& operator=(filtered_join_probe_state&&)      = delete;
+
+  /**
+   * @brief Returns the exact number of selected probe rows.
+   */
+  [[nodiscard]] size_type output_size() const;
+
+  /**
+   * @brief Returns device bytes retained by this probe state.
+   */
+  [[nodiscard]] std::size_t device_allocated_size_bytes() const;
+
+  /**
+   * @brief Materializes selected probe indices from retained membership state.
+   *
+   * The returned vector is allocated at exactly `output_size()` rows.
+   */
+  [[nodiscard]] std::unique_ptr<rmm::device_uvector<size_type>> materialize_indices(
+    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref()) const;
+
+ private:
+  explicit filtered_join_probe_state(
+    std::unique_ptr<cudf::detail::filtered_join_probe_state> impl);
+
+  std::unique_ptr<cudf::detail::filtered_join_probe_state> _impl;
+
+  friend class filtered_join;
+};
 
 /**
  * @brief Filtered hash join that builds hash table on creation and probes results in subsequent
@@ -146,6 +194,28 @@ class filtered_join {
    * the result of performing a left anti join
    */
   [[nodiscard]] std::unique_ptr<rmm::device_uvector<size_type>> anti_join(
+    cudf::table_view const& probe,
+    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref()) const;
+
+  /**
+   * @brief Begin a retained left-semi probe.
+   *
+   * This performs the filtered-join hash-table probe once and retains the
+   * membership state needed to later materialize selected probe indices.
+   */
+  [[nodiscard]] std::unique_ptr<filtered_join_probe_state> begin_left_semi_probe(
+    cudf::table_view const& probe,
+    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref()) const;
+
+  /**
+   * @brief Begin a retained left-anti probe.
+   *
+   * This performs the filtered-join hash-table probe once and retains the
+   * membership state needed to later materialize selected probe indices.
+   */
+  [[nodiscard]] std::unique_ptr<filtered_join_probe_state> begin_left_anti_probe(
     cudf::table_view const& probe,
     rmm::cuda_stream_view stream      = cudf::get_default_stream(),
     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref()) const;

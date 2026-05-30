@@ -39,7 +39,54 @@ using Table          = cudf::table;
 struct SemiAntiJoinTest : public cudf::test::BaseFixture,
                           public ::testing::WithParamInterface<cudf::set_as_build_table> {};
 
+struct FilteredJoinProbeStateTest : public cudf::test::BaseFixture {};
+
 namespace {
+void expect_probe_state_matches_join(cudf::table_view const& build,
+                                     cudf::table_view const& probe,
+                                     std::vector<cudf::size_type> const& expected_semi,
+                                     std::vector<cudf::size_type> const& expected_anti)
+{
+  cudf::filtered_join obj(
+    build, cudf::null_equality::EQUAL, cudf::set_as_build_table::RIGHT, cudf::get_default_stream());
+
+  auto const semi_state = obj.begin_left_semi_probe(
+    probe, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  EXPECT_EQ(semi_state->output_size(), expected_semi.size());
+  auto const semi_indices = semi_state->materialize_indices(
+    cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  EXPECT_EQ(semi_indices->size(), expected_semi.size());
+  EXPECT_EQ(semi_indices->capacity(), expected_semi.size());
+  auto const semi_span = cudf::device_span<cudf::size_type const>{*semi_indices};
+  auto const semi_col  = cudf::column_view{semi_span};
+  column_wrapper<cudf::size_type> semi_expected(expected_semi.begin(), expected_semi.end());
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(semi_expected, semi_col);
+
+  auto const legacy_semi =
+    obj.semi_join(probe, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto const legacy_semi_span = cudf::device_span<cudf::size_type const>{*legacy_semi};
+  auto const legacy_semi_col  = cudf::column_view{legacy_semi_span};
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(legacy_semi_col, semi_col);
+
+  auto const anti_state = obj.begin_left_anti_probe(
+    probe, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  EXPECT_EQ(anti_state->output_size(), expected_anti.size());
+  auto const anti_indices = anti_state->materialize_indices(
+    cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  EXPECT_EQ(anti_indices->size(), expected_anti.size());
+  EXPECT_EQ(anti_indices->capacity(), expected_anti.size());
+  auto const anti_span = cudf::device_span<cudf::size_type const>{*anti_indices};
+  auto const anti_col  = cudf::column_view{anti_span};
+  column_wrapper<cudf::size_type> anti_expected(expected_anti.begin(), expected_anti.end());
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(anti_expected, anti_col);
+
+  auto const legacy_anti =
+    obj.anti_join(probe, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto const legacy_anti_span = cudf::device_span<cudf::size_type const>{*legacy_anti};
+  auto const legacy_anti_col  = cudf::column_view{legacy_anti_span};
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(legacy_anti_col, anti_col);
+}
+
 // Helper to perform semi/anti join with configurable build side
 std::unique_ptr<cudf::table> left_semi_join(
   cudf::table_view const& left_input,
@@ -101,6 +148,77 @@ std::unique_ptr<cudf::table> left_anti_join(
   }
 }
 }  // namespace
+
+TEST_F(FilteredJoinProbeStateTest, MaterializesRetainedSemiAntiProbeState)
+{
+  column_wrapper<int32_t> build_col{2, 4};
+  column_wrapper<int32_t> probe_col{1, 2, 2, 4};
+  auto const build = cudf::table_view{{build_col}};
+  auto const probe = cudf::table_view{{probe_col}};
+
+  expect_probe_state_matches_join(build, probe, {1, 2, 3}, {0});
+}
+
+TEST_F(FilteredJoinProbeStateTest, HandlesAllMatchAndNoMatchCases)
+{
+  {
+    column_wrapper<int32_t> build_col{1, 2, 3};
+    column_wrapper<int32_t> probe_col{1, 2, 3};
+    auto const build = cudf::table_view{{build_col}};
+    auto const probe = cudf::table_view{{probe_col}};
+
+    expect_probe_state_matches_join(build, probe, {0, 1, 2}, {});
+  }
+  {
+    column_wrapper<int32_t> build_col{7, 8};
+    column_wrapper<int32_t> probe_col{1, 2, 3};
+    auto const build = cudf::table_view{{build_col}};
+    auto const probe = cudf::table_view{{probe_col}};
+
+    expect_probe_state_matches_join(build, probe, {}, {0, 1, 2});
+  }
+}
+
+TEST_F(FilteredJoinProbeStateTest, EmptyInputsUseExactStateAndMaterializationSizes)
+{
+  cudf::table empty_build{};
+  cudf::table empty_probe{};
+  column_wrapper<int32_t> nonempty_col{10, 20, 30};
+  auto const nonempty = cudf::table_view{{nonempty_col}};
+
+  {
+    cudf::filtered_join obj(empty_build,
+                            cudf::null_equality::EQUAL,
+                            cudf::set_as_build_table::RIGHT,
+                            cudf::get_default_stream());
+    auto const anti_state = obj.begin_left_anti_probe(
+      nonempty, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+    EXPECT_EQ(anti_state->output_size(), nonempty.num_rows());
+    EXPECT_EQ(anti_state->device_allocated_size_bytes(), 0);
+    auto const anti_indices = anti_state->materialize_indices(
+      cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+    EXPECT_EQ(anti_indices->size(), nonempty.num_rows());
+    EXPECT_EQ(anti_indices->capacity(), nonempty.num_rows());
+    auto const anti_span = cudf::device_span<cudf::size_type const>{*anti_indices};
+    auto const anti_col  = cudf::column_view{anti_span};
+    column_wrapper<cudf::size_type> expected{0, 1, 2};
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, anti_col);
+  }
+  {
+    cudf::filtered_join obj(nonempty,
+                            cudf::null_equality::EQUAL,
+                            cudf::set_as_build_table::RIGHT,
+                            cudf::get_default_stream());
+    auto const semi_state = obj.begin_left_semi_probe(
+      empty_probe, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+    EXPECT_EQ(semi_state->output_size(), 0);
+    EXPECT_EQ(semi_state->device_allocated_size_bytes(), 0);
+    auto const semi_indices = semi_state->materialize_indices(
+      cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+    EXPECT_EQ(semi_indices->size(), 0);
+    EXPECT_EQ(semi_indices->capacity(), 0);
+  }
+}
 
 TEST_P(SemiAntiJoinTest, TestSimple)
 {

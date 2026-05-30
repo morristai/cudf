@@ -31,6 +31,34 @@ using cudf::detail::row::lhs_index_type;
 using cudf::detail::row::rhs_index_type;
 
 /**
+ * @brief Retained filtered-join probe state.
+ *
+ * A probe state owns the device-side membership result of probing a reusable
+ * filtered join. Callers can inspect the exact selected row count before
+ * materializing the final gather map.
+ */
+class filtered_join_probe_state {
+ public:
+  virtual ~filtered_join_probe_state() = default;
+
+  /**
+   * @brief Returns the exact number of rows selected by this probe.
+   */
+  [[nodiscard]] virtual cudf::size_type output_size() const = 0;
+
+  /**
+   * @brief Returns retained device bytes owned by this probe state.
+   */
+  [[nodiscard]] virtual std::size_t device_allocated_size_bytes() const = 0;
+
+  /**
+   * @brief Materializes selected probe indices from the retained state.
+   */
+  [[nodiscard]] virtual std::unique_ptr<rmm::device_uvector<cudf::size_type>>
+  materialize_indices(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const = 0;
+};
+
+/**
  * @brief Base class providing common functionality for filtered join operations.
  *
  * This abstract class implements the core components needed for hash-based semi
@@ -148,6 +176,22 @@ class filtered_join {
    * Virtual anti join function overridden in derived classes
    */
   virtual std::unique_ptr<rmm::device_uvector<cudf::size_type>> anti_join(
+    cudf::table_view const& probe,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) = 0;
+
+  /**
+   * Virtual semi probe-state function overridden in derived classes.
+   */
+  virtual std::unique_ptr<filtered_join_probe_state> begin_left_semi_probe(
+    cudf::table_view const& probe,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) = 0;
+
+  /**
+   * Virtual anti probe-state function overridden in derived classes.
+   */
+  virtual std::unique_ptr<filtered_join_probe_state> begin_left_anti_probe(
     cudf::table_view const& probe,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) = 0;

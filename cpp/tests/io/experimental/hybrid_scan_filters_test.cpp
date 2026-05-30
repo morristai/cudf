@@ -77,6 +77,39 @@ auto filter_row_groups_with_dictionaries(
   return dict_page_filtered_row_group_indices;
 }
 
+template <typename DecimalType>
+auto create_decimal_dictionary_parquet()
+{
+  using RepType = typename DecimalType::rep;
+
+  auto constexpr scale = numeric::scale_type{-2};
+  std::vector<RepType> values(num_ordered_rows);
+  std::generate(values.begin(), values.end(), [row_idx = cudf::size_type{0}]() mutable {
+    auto const row_group_idx = row_idx++ / page_size_for_ordered_tests;
+    return row_group_idx == 0 or row_group_idx == 2 ? RepType{-500} : RepType{100};
+  });
+  auto amount =
+    cudf::test::fixed_point_column_wrapper<RepType>(values.begin(), values.end(), scale);
+  auto output = cudf::table_view{{amount}};
+
+  cudf::io::table_input_metadata metadata(output);
+  metadata.column_metadata[0].set_name("amount");
+
+  std::vector<char> buffer;
+  auto const out_opts =
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{&buffer}, output)
+      .metadata(std::move(metadata))
+      .row_group_size_rows(page_size_for_ordered_tests)
+      .max_page_size_rows(page_size_for_ordered_tests / 5)
+      .compression(cudf::io::compression_type::NONE)
+      .dictionary_policy(cudf::io::dictionary_policy::ALWAYS)
+      .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
+      .build();
+  cudf::io::write_parquet(out_opts);
+
+  return buffer;
+}
+
 }  // namespace
 
 // Base test fixture for tests
@@ -1193,7 +1226,47 @@ TEST_F(HybridScanFiltersTest, FilterRowGroupsWithDictionary)
 template <typename T>
 struct RowGroupFilteringWithDictTest : public HybridScanFiltersTest {};
 
-// Booleans and fixed-point types are not supported for dictionary based filtering
+template <typename T>
+struct RowGroupFilteringWithDecimalDictTest : public HybridScanFiltersTest {};
+
+TYPED_TEST_SUITE(RowGroupFilteringWithDecimalDictTest, cudf::test::FixedPointTypes);
+
+TYPED_TEST(RowGroupFilteringWithDecimalDictTest, EqualityPredicatePrunesRowGroups)
+{
+  using T       = TypeParam;
+  using RepType = typename T::rep;
+
+  auto const buffer = create_decimal_dictionary_parquet<T>();
+  auto stream       = cudf::get_default_stream();
+  auto mr           = cudf::get_current_device_resource_ref();
+
+  auto const datasource = cudf::io::datasource::create(cudf::host_span<std::byte const>(
+    reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()));
+  auto datasource_ref   = std::ref(*datasource);
+
+  auto options             = cudf::io::parquet_reader_options::builder().build();
+  auto const footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
+  auto const reader =
+    std::make_unique<cudf::io::parquet::experimental::hybrid_scan_reader>(*footer_buffer, options);
+  auto const page_index_byte_range = reader->page_index_byte_range();
+  auto const page_index_buffer =
+    cudf::io::parquet::fetch_page_index_to_host(*datasource, page_index_byte_range);
+  reader->setup_page_index(*page_index_buffer);
+  auto const reader_ref = std::ref(*reader);
+
+  auto literal_value     = cudf::fixed_point_scalar<T>(RepType{-500}, numeric::scale_type{-2});
+  auto literal           = cudf::ast::literal(literal_value);
+  auto amount            = cudf::ast::column_name_reference("amount");
+  auto filter_expression = cudf::ast::operation(cudf::ast::ast_operator::EQUAL, amount, literal);
+
+  auto const result =
+    filter_row_groups_with_dictionaries(datasource_ref, reader_ref, filter_expression, stream, mr);
+  auto const expected = std::vector<cudf::size_type>{0, 2};
+  EXPECT_EQ(result, expected);
+}
+
+// Booleans are not supported for dictionary based filtering. Fixed-point
+// dictionary equality is pinned by targeted decimal coverage above.
 using DictionaryTestTypes =
   cudf::test::RemoveIf<cudf::test::ContainedIn<cudf::test::Types<bool>>, SupportedTestTypesJIT>;
 

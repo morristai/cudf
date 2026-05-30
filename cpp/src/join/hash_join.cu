@@ -17,6 +17,7 @@
 #include <cudf/detail/structs/utilities.hpp>
 #include <cudf/join/hash_join.hpp>
 #include <cudf/join/join.hpp>
+#include <cudf/table/table_device_view.cuh>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/prefetch.hpp>
@@ -28,6 +29,8 @@
 #include <rmm/exec_policy.hpp>
 #include <rmm/mr/polymorphic_allocator.hpp>
 
+#include <cuco/extent.cuh>
+#include <cuco/storage.cuh>
 #include <cuda/iterator>
 #include <cuda/std/functional>
 #include <cuda/std/iterator>
@@ -35,13 +38,64 @@
 #include <thrust/scatter.h>
 #include <thrust/uninitialized_fill.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <memory>
 
 namespace cudf {
 namespace detail {
 namespace {
 using hash_table_t = cudf::hash_join::impl_type::hash_table_t;
+
+std::size_t checked_add(std::size_t lhs, std::size_t rhs)
+{
+  CUDF_EXPECTS(lhs <= std::numeric_limits<std::size_t>::max() - rhs,
+               "hash join pre-build reservation size overflow",
+               std::overflow_error);
+  return lhs + rhs;
+}
+
+std::size_t checked_mul(std::size_t lhs, std::size_t rhs)
+{
+  CUDF_EXPECTS(rhs == 0 || lhs <= std::numeric_limits<std::size_t>::max() / rhs,
+               "hash join pre-build reservation size overflow",
+               std::overflow_error);
+  return lhs * rhs;
+}
+
+std::size_t hash_join_slot_storage_reservation_size(cudf::size_type rows, double load_factor)
+{
+  using slot_t    = hash_table_t::value_type;
+  using probing_t = hash_table_t::probing_scheme_type;
+  using storage_t = cuco::storage<hash_table_t::bucket_size>;
+
+  auto const extent = cuco::make_valid_extent<probing_t, storage_t>(
+    cuco::extent<std::size_t>{static_cast<std::size_t>(rows)}, load_factor);
+  auto const capacity_slots = static_cast<std::size_t>(extent);
+  constexpr auto alignment  = hash_table_t::storage_ref_type::alignment;
+  // Mirrors cuco::bucket_storage allocation padding for alignment slack and a sentinel slot.
+  constexpr auto extra_slots = (alignment - 1) / sizeof(slot_t) + 1;
+  return checked_mul(checked_add(capacity_slots, extra_slots), sizeof(slot_t));
+}
+
+std::size_t flat_table_device_view_reservation_size(cudf::table_view const& table)
+{
+  auto view_bytes = std::size_t{0};
+  for (auto const& column : table) {
+    view_bytes = checked_add(view_bytes, cudf::column_device_view::extent(column));
+  }
+  if (view_bytes == 0) { return 0; }
+  return checked_add(view_bytes, alignof(cudf::column_device_view) - 1);
+}
+
+bool has_unsupported_retained_preprocessing_buffers(cudf::table_view const& table)
+{
+  return cudf::detail::has_nested_columns(table) ||
+         std::any_of(table.begin(), table.end(), [](auto const& column) {
+           return cudf::may_have_nonempty_nulls(column);
+         });
+}
 
 /**
  * @brief Checks if a join operation is trivial (empty tables or certain join types with empty
@@ -878,6 +932,22 @@ hash_join::hash_join(cudf::table_view const& build,
   : _impl{std::make_unique<impl_type const>(
       build, has_nulls == nullable_join::YES, compare_nulls, load_factor, stream)}
 {
+}
+
+std::size_t hash_join::pre_build_reservation_size(cudf::table_view const& build, double load_factor)
+{
+  CUDF_EXPECTS(0 != build.num_columns(), "Hash join build table is empty", std::invalid_argument);
+  CUDF_EXPECTS(load_factor > 0 && load_factor <= 1,
+               "Invalid load factor: must be greater than 0 and less than or equal to 1.",
+               std::invalid_argument);
+  CUDF_EXPECTS(!detail::has_unsupported_retained_preprocessing_buffers(build),
+               "Hash join pre-build reservation sizing does not support build keys that may retain "
+               "preprocessing buffers",
+               std::invalid_argument);
+
+  return detail::checked_add(
+    detail::hash_join_slot_storage_reservation_size(build.num_rows(), load_factor),
+    detail::flat_table_device_view_reservation_size(build));
 }
 
 std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,

@@ -45,6 +45,15 @@ class distinct_filtered_join : public filtered_join {
     rmm::device_async_resource_ref mr);
 
   /**
+   * @brief Begins either a semi or anti retained probe based on the specified kind.
+   */
+  std::unique_ptr<cudf::detail::filtered_join_probe_state> semi_anti_probe_state(
+    cudf::table_view const& probe,
+    join_kind kind,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+  /**
    * @brief Core implementation for querying the hash table
    *
    * Performs the actual hash table query operation for both semi and anti joins
@@ -62,6 +71,18 @@ class distinct_filtered_join : public filtered_join {
    */
   template <int32_t CGSize, typename Ref>
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> query_build_table(
+    cudf::table_view const& probe,
+    std::shared_ptr<cudf::detail::row::equality::preprocessed_table> preprocessed_probe,
+    join_kind kind,
+    Ref query_ref,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+  /**
+   * @brief Core implementation for beginning a retained semi/anti probe.
+   */
+  template <int32_t CGSize, typename Ref>
+  std::unique_ptr<cudf::detail::filtered_join_probe_state> begin_query_build_table_probe(
     cudf::table_view const& probe,
     std::shared_ptr<cudf::detail::row::equality::preprocessed_table> preprocessed_probe,
     join_kind kind,
@@ -109,6 +130,22 @@ class distinct_filtered_join : public filtered_join {
    * @return Device vector of indices representing the join result
    */
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> anti_join(
+    cudf::table_view const& probe,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) override;
+
+  /**
+   * @brief Begin a retained left-semi probe.
+   */
+  std::unique_ptr<cudf::detail::filtered_join_probe_state> begin_left_semi_probe(
+    cudf::table_view const& probe,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) override;
+
+  /**
+   * @brief Begin a retained left-anti probe.
+   */
+  std::unique_ptr<cudf::detail::filtered_join_probe_state> begin_left_anti_probe(
     cudf::table_view const& probe,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) override;

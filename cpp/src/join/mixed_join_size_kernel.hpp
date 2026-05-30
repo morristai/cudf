@@ -66,6 +66,7 @@ void launch_mixed_join_count(
   cuda::std::pair<uint32_t, uint32_t> const* hash_indices,
   ast::detail::expression_device_view device_expression_data,
   cudf::device_span<cudf::size_type> matches_per_row,
+  cudf::device_span<cudf::size_type> build_row_has_match,
   detail::grid_1d config,
   int64_t shmem_size_per_block,
   rmm::cuda_stream_view stream);

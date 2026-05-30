@@ -21,7 +21,7 @@ void table_device_view_base<ColumnDeviceView, HostTableView>::destroy()
 
 template <typename ColumnDeviceView, typename HostTableView>
 table_device_view_base<ColumnDeviceView, HostTableView>::table_device_view_base(
-  HostTableView source_view, rmm::cuda_stream_view stream)
+  HostTableView source_view, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
   : _num_rows{source_view.num_rows()}, _num_columns{source_view.num_columns()}
 {
   // The table's columns must be converted to ColumnDeviceView
@@ -30,7 +30,7 @@ table_device_view_base<ColumnDeviceView, HostTableView>::table_device_view_base(
   if (source_view.num_columns() > 0) {
     std::unique_ptr<rmm::device_buffer> descendant_storage_owner;
     std::tie(descendant_storage_owner, _columns) =
-      contiguous_copy_column_device_views<ColumnDeviceView, HostTableView>(source_view, stream);
+      contiguous_copy_column_device_views<ColumnDeviceView, HostTableView>(source_view, stream, mr);
     _descendant_storage = descendant_storage_owner.release();
   }
 }

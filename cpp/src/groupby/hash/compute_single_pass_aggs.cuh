@@ -71,6 +71,13 @@ std::pair<rmm::device_uvector<size_type>, bool> compute_single_pass_aggs(
   // empty: empty input should already been handled before reaching here.
   if (grid_size <= 0) { return run_aggs_by_global_mem_kernel(); }
 
+  // The shared-memory aggregation path currently miscomputes result rows for several valid
+  // groupby shapes, including multi-value requests, nullable/string keys, and TPC-DS aggregation
+  // plans that use a single fixed-width value column. Keep single-pass groupby aggregation on the
+  // global-memory path until the shared-memory kernels model the same correctness contract.
+  auto constexpr enable_shared_memory_groupby = false;
+  if constexpr (!enable_shared_memory_groupby) { return run_aggs_by_global_mem_kernel(); }
+
   auto const [can_use_shared_mem_kernel, available_shmem_size] =
     is_shared_memory_compatible(agg_kinds, values, grid_size);
 

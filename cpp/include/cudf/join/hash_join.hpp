@@ -106,6 +106,30 @@ class hash_join {
             rmm::cuda_stream_view stream = cudf::get_default_stream());
 
   /**
+   * @brief Returns exact retained device bytes that must be reserved before constructing a reusable
+   * hash join build artifact.
+   *
+   * This is a planning contract for bounded execution. It computes the device allocation requests
+   * retained by `cudf::hash_join` construction without building the hash table or retaining the
+   * build table. It does not include transient allocations freed before the constructor returns.
+   *
+   * The result is exact for supported build-key tables whose retained construction allocations are
+   * limited to reusable hash table storage and build-key device views. Inputs whose equality
+   * preprocessing may retain additional buffers are rejected.
+   *
+   * @throws std::invalid_argument if `build` has no columns, `load_factor` is not in `(0, 1]`, or
+   * the build-key table contains columns whose retained preprocessing bytes are not yet supported
+   * by this API.
+   *
+   * @param build The build table that will later be passed to `cudf::hash_join`
+   * @param load_factor The hash table occupancy ratio in `(0, 1]`
+   *
+   * @return Exact retained device bytes requested by supported `cudf::hash_join` construction
+   */
+  [[nodiscard]] static std::size_t pre_build_reservation_size(cudf::table_view const& build,
+                                                              double load_factor);
+
+  /**
    * Returns the row indices that can be used to construct the result of performing
    * an inner join between two tables. @see cudf::inner_join(). Behavior is undefined if the
    * provided `output_size` is smaller than the actual output size.

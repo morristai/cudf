@@ -33,13 +33,23 @@ __device__ __forceinline__ auto standalone_count(
   cudf::device_span<cuco::pair<hash_value_type, cudf::size_type>> hash_table_storage,
   cuco::pair<hash_value_type, cudf::size_type> const& probe_key,
   cuda::std::pair<hash_value_type, hash_value_type> const& hash_idx,
-  bool is_outer_join) noexcept
+  bool is_outer_join,
+  cudf::device_span<cudf::size_type> build_row_has_match) noexcept
 {
   cudf::size_type count = 0;
   auto prober = hash_table_prober<has_nulls>{key_equal, hash_table_storage, probe_key, hash_idx};
 
   while (true) {
     auto const result = prober.probe_current_bucket();
+    if (build_row_has_match.data() != nullptr && result.has_match()) {
+      auto const bucket_slots = prober.get_bucket_slots();
+      if (result.first_slot_equals_) {
+        atomicExch(build_row_has_match.data() + bucket_slots.first.second, 1);
+      }
+      if (result.second_slot_equals_) {
+        atomicExch(build_row_has_match.data() + bucket_slots.second.second, 1);
+      }
+    }
     count += result.match_count();
 
     // Exit if we find an empty slot
@@ -64,7 +74,8 @@ CUDF_KERNEL void __launch_bounds__(DEFAULT_JOIN_BLOCK_SIZE) mixed_join_count(
   cuco::pair<hash_value_type, cudf::size_type> const* input_pairs,
   cuda::std::pair<hash_value_type, hash_value_type> const* hash_indices,
   ast::detail::expression_device_view device_expression_data,
-  cudf::device_span<cudf::size_type> matches_per_row)
+  cudf::device_span<cudf::size_type> matches_per_row,
+  cudf::device_span<cudf::size_type> build_row_has_match)
 {
   // The (required) extern storage of the shared memory array leads to
   // conflicting declarations between different templates. The easiest
@@ -95,8 +106,8 @@ CUDF_KERNEL void __launch_bounds__(DEFAULT_JOIN_BLOCK_SIZE) mixed_join_count(
     auto const& probe_key = input_pairs[outer_row_index];
     auto const& hash_idx  = hash_indices[outer_row_index];
 
-    auto match_count =
-      standalone_count(count_equality, hash_table_storage, probe_key, hash_idx, is_outer_join);
+    auto match_count = standalone_count(
+      count_equality, hash_table_storage, probe_key, hash_idx, is_outer_join, build_row_has_match);
 
     matches_per_row[outer_row_index] = match_count;
   }
@@ -114,6 +125,7 @@ void launch_mixed_join_count(
   cuda::std::pair<hash_value_type, hash_value_type> const* hash_indices,
   ast::detail::expression_device_view device_expression_data,
   cudf::device_span<cudf::size_type> matches_per_row,
+  cudf::device_span<cudf::size_type> build_row_has_match,
   detail::grid_1d config,
   int64_t shmem_size_per_block,
   rmm::cuda_stream_view stream)
@@ -129,7 +141,8 @@ void launch_mixed_join_count(
       input_pairs,
       hash_indices,
       device_expression_data,
-      matches_per_row);
+      matches_per_row,
+      build_row_has_match);
 }
 
 }  // namespace cudf::detail
